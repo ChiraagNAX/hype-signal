@@ -42,6 +42,15 @@ STALE_ERR_S  <- 120
 CEX_CACHE    <- "data/cex_cache.rds"
 CEX_CACHE_MAX_AGE <- 86400
 
+# Account & fee model
+ACCOUNT_SIZE <- 10000
+MAX_RISK_PCT <- 0.02
+FEE_MAKER    <- 0.0005
+FEE_TAKER    <- 0.0006
+SLIPPAGE_EST <- 0.0003
+ROUND_TRIP   <- FEE_MAKER + FEE_TAKER + 2*SLIPPAGE_EST
+MAX_POS_PCT  <- 0.20
+
 # =============================================================================
 # HTTP HELPERS
 # =============================================================================
@@ -211,8 +220,8 @@ cex_cache_wrap <- function(live_fn, cache_key) {
       return(list(ok=TRUE,data=cache[[cache_key]],fetched_at=cache$fetched_at,error_msg=NA_character_))
     return(list(ok=FALSE,data=NULL,fetched_at=as.numeric(Sys.time()),error_msg="no cache"))
   }
-  r<-live_fn()
-  if(!r$ok) { cache<-read_cex_cache(); if(!is.null(cache)&&!is.null(cache[[cache_key]]))
+  r<-tryCatch(live_fn(), error=function(e) list(ok=FALSE,data=NULL,fetched_at=as.numeric(Sys.time()),error_msg=conditionMessage(e)))
+  if(!isTRUE(r$ok)) { cache<-read_cex_cache(); if(!is.null(cache)&&!is.null(cache[[cache_key]]))
     r<-list(ok=TRUE,data=cache[[cache_key]],fetched_at=cache$fetched_at,error_msg=NA_character_) }
   r
 }
@@ -592,7 +601,153 @@ build_trade_plan <- function(sig_result, hl_ctx, ob_result) {
        lbl_tp2=if(is_neutral) "Support" else "Target 2",
        invalidation=invalidation,
        horizon=horizon, sizing=sizing, conviction=conviction,
-       edge_notes=notes, fr_cost_8h=round(fr_cost_8h,4))
+       edge_notes=notes, fr_cost_8h=round(fr_cost_8h,4),
+       entry_num=if(is.numeric(entry_zone)) entry_zone else NA_real_,
+       stop_num=if(is.numeric(stop_loss)) stop_loss else NA_real_,
+       tp1_num=if(is.numeric(tp1)) tp1 else NA_real_,
+       tp2_num=if(is.numeric(tp2)) tp2 else NA_real_,
+       direction=if(sc>20) "LONG" else if(sc< -20) "SHORT" else "FLAT",
+       score=sc)
+}
+
+# =============================================================================
+# POSITION MANAGER
+# =============================================================================
+
+new_position <- function() {
+  list(state="FLAT", direction=NA, entry_px=NA, size_usd=NA, size_coins=NA,
+       stop_px=NA, tp1_px=NA, tp2_px=NA, opened_at=NA, horizon_end=NA,
+       pending_entry=NA, pending_dir=NA, pending_stop=NA, pending_tp1=NA,
+       pending_tp2=NA, pending_size_usd=NA, pending_size_coins=NA,
+       pending_score=NA, pending_at=NA, pending_horizon_s=NA,
+       realized_pnl=0, trade_log=list())
+}
+
+calc_position_size <- function(conviction, px, stop_px) {
+  mult <- switch(conviction, "High"=1.0, "Medium"=0.5, "Low"=0.25, 0)
+  max_usd <- ACCOUNT_SIZE * MAX_POS_PCT * mult
+  if(!is.na(stop_px) && !is.na(px) && px > 0 && stop_px > 0) {
+    risk_per_coin <- abs(px - stop_px)
+    if(risk_per_coin > 0) {
+      risk_budget <- ACCOUNT_SIZE * MAX_RISK_PCT * mult
+      risk_coins <- risk_budget / risk_per_coin
+      risk_usd <- risk_coins * px
+      max_usd <- min(max_usd, risk_usd)
+    }
+  }
+  coins <- if(px > 0) max_usd / px else 0
+  list(usd=round(max_usd, 2), coins=round(coins, 3))
+}
+
+horizon_to_seconds <- function(h) {
+  if(grepl("4-12", h)) 8*3600
+  else if(grepl("1-4", h)) 2.5*3600
+  else if(grepl("15-60", h)) 37*60
+  else if(grepl("5-15", h)) 10*60
+  else 4*3600
+}
+
+calc_pnl <- function(pos, cur_px) {
+  if(is.na(pos$entry_px) || is.na(cur_px)) return(list(usd=0, pct=0, net_usd=0, net_pct=0))
+  raw <- if(pos$direction=="LONG") (cur_px - pos$entry_px) / pos$entry_px
+         else (pos$entry_px - cur_px) / pos$entry_px
+  gross_usd <- raw * pos$size_usd
+  fees_usd <- pos$size_usd * ROUND_TRIP
+  net_usd <- gross_usd - fees_usd
+  net_pct <- if(pos$size_usd > 0) net_usd / pos$size_usd * 100 else 0
+  list(usd=round(gross_usd,2), pct=round(raw*100,2), net_usd=round(net_usd,2), net_pct=round(net_pct,2),
+       fees=round(fees_usd,2))
+}
+
+update_position <- function(pos, sig_result, tplan, cur_px) {
+  if(is.na(cur_px)) return(pos)
+  now <- as.numeric(Sys.time())
+
+  if(pos$state == "FLAT") {
+    if(tplan$direction != "FLAT" && !is.na(tplan$entry_num) && !is.na(tplan$stop_num)) {
+      sz <- calc_position_size(tplan$conviction, tplan$entry_num, tplan$stop_num)
+      if(sz$usd > 0) {
+        pos$state <- "PENDING"
+        pos$pending_dir <- tplan$direction
+        pos$pending_entry <- tplan$entry_num
+        pos$pending_stop <- tplan$stop_num
+        pos$pending_tp1 <- tplan$tp1_num
+        pos$pending_tp2 <- tplan$tp2_num
+        pos$pending_size_usd <- sz$usd
+        pos$pending_size_coins <- sz$coins
+        pos$pending_score <- tplan$score
+        pos$pending_at <- now
+        pos$pending_horizon_s <- horizon_to_seconds(tplan$horizon)
+      }
+    }
+    return(pos)
+  }
+
+  if(pos$state == "PENDING") {
+    age <- now - pos$pending_at
+    if(age > 300) {
+      pos$state <- "FLAT"; return(pos)
+    }
+    cur_score <- sig_result$score
+    if(pos$pending_dir == "LONG" && cur_score < 10) {
+      pos$state <- "FLAT"; return(pos)
+    }
+    if(pos$pending_dir == "SHORT" && cur_score > -10) {
+      pos$state <- "FLAT"; return(pos)
+    }
+    filled <- FALSE
+    if(pos$pending_dir == "LONG" && cur_px <= pos$pending_entry * 1.001) filled <- TRUE
+    if(pos$pending_dir == "SHORT" && cur_px >= pos$pending_entry * 0.999) filled <- TRUE
+    if(pos$pending_dir == "LONG" && cur_score > 40) filled <- TRUE
+    if(pos$pending_dir == "SHORT" && cur_score < -40) filled <- TRUE
+    if(filled) {
+      pos$state <- "OPEN"
+      pos$direction <- pos$pending_dir
+      pos$entry_px <- cur_px
+      pos$size_usd <- pos$pending_size_usd
+      pos$size_coins <- pos$pending_size_coins
+      pos$stop_px <- pos$pending_stop
+      pos$tp1_px <- pos$pending_tp1
+      pos$tp2_px <- pos$pending_tp2
+      pos$opened_at <- now
+      pos$horizon_end <- now + pos$pending_horizon_s
+    }
+    return(pos)
+  }
+
+  if(pos$state == "OPEN") {
+    pnl <- calc_pnl(pos, cur_px)
+    exit_reason <- NULL
+
+    if(pos$direction == "LONG") {
+      if(cur_px <= pos$stop_px) exit_reason <- "STOP LOSS"
+      if(!is.na(pos$tp2_px) && cur_px >= pos$tp2_px) exit_reason <- "TARGET 2 HIT"
+      if(sig_result$score < -20) exit_reason <- "SIGNAL FLIPPED BEARISH"
+    } else {
+      if(cur_px >= pos$stop_px) exit_reason <- "STOP LOSS"
+      if(!is.na(pos$tp2_px) && cur_px <= pos$tp2_px) exit_reason <- "TARGET 2 HIT"
+      if(sig_result$score > 20) exit_reason <- "SIGNAL FLIPPED BULLISH"
+    }
+
+    if(now > pos$horizon_end) exit_reason <- "HORIZON EXPIRED"
+    if(pnl$net_pct < -3) exit_reason <- "MAX LOSS BREACHED"
+
+    if(!is.null(exit_reason)) {
+      trade <- list(dir=pos$direction, entry=pos$entry_px, exit=cur_px,
+                    size_usd=pos$size_usd, pnl_usd=pnl$net_usd, pnl_pct=pnl$net_pct,
+                    fees=pnl$fees, reason=exit_reason,
+                    opened=pos$opened_at, closed=now,
+                    duration_m=round((now - pos$opened_at)/60,1))
+      pos$trade_log <- c(pos$trade_log, list(trade))
+      pos$realized_pnl <- pos$realized_pnl + pnl$net_usd
+      pos$state <- "FLAT"
+      pos$direction <- NA; pos$entry_px <- NA; pos$size_usd <- NA
+      pos$size_coins <- NA; pos$stop_px <- NA; pos$tp1_px <- NA
+      pos$tp2_px <- NA; pos$opened_at <- NA; pos$horizon_end <- NA
+    }
+    return(pos)
+  }
+  pos
 }
 
 # =============================================================================
@@ -729,11 +884,15 @@ ui <- page_fluid(
       )
     ),
 
-    # MIDDLE — trade plan
+    # MIDDLE — trade plan + position
     column(5,
       div(class="card", style="padding:20px;",
         div(class="sh", "Trade Plan"),
         uiOutput("trade_plan")
+      ),
+      div(class="card", style="padding:16px; margin-top:8px;",
+        div(class="sh", "Position Tracker ($10K Account)"),
+        uiOutput("position_tracker")
       )
     ),
 
@@ -791,7 +950,8 @@ server <- function(input, output, session) {
     c_bn_5m=NULL, c_bn_1h=NULL,
     c_at=NA,
     prev_oi=NA_real_,
-    last_upd=Sys.time()
+    last_upd=Sys.time(),
+    pos=new_position()
   )
 
   t_price<-reactiveTimer(PRICE_MS)
@@ -854,6 +1014,12 @@ server <- function(input, output, session) {
   })
 
   tplan<-reactive(build_trade_plan(sig(), rv$r_hl_ctx, ob_result()))
+
+  observe({
+    s <- sig(); tp <- tplan()
+    px <- s$cur_px
+    if(!is.na(px)) rv$pos <- update_position(rv$pos, s, tp, px)
+  })
 
   # =============================================================================
   # OUTPUTS
@@ -939,17 +1105,25 @@ server <- function(input, output, session) {
           div(class="tp-box-val", style="color:#16a34a;", tp$tp2))
       ),
 
-      div(class="tp-meta",
-        div(class="tp-meta-item",
-          div(class="tp-meta-lbl","Horizon"),
-          div(class="tp-meta-val", tp$horizon)),
-        div(class="tp-meta-item",
-          div(class="tp-meta-lbl","Conviction"),
-          div(class="tp-meta-val", tp$conviction)),
-        div(class="tp-meta-item",
-          div(class="tp-meta-lbl","Sizing"),
-          div(class="tp-meta-val", tp$sizing))
-      ),
+      {
+        sz <- if(!is.na(tp$entry_num) && !is.na(tp$stop_num) && tp$direction != "FLAT")
+          calc_position_size(tp$conviction, tp$entry_num, tp$stop_num) else list(usd=0,coins=0)
+        cost_rt <- round(sz$usd * ROUND_TRIP, 2)
+        div(class="tp-meta",
+          div(class="tp-meta-item",
+            div(class="tp-meta-lbl","Horizon"),
+            div(class="tp-meta-val", tp$horizon)),
+          div(class="tp-meta-item",
+            div(class="tp-meta-lbl","Conviction"),
+            div(class="tp-meta-val", tp$conviction)),
+          div(class="tp-meta-item",
+            div(class="tp-meta-lbl","Size"),
+            div(class="tp-meta-val", if(sz$usd>0) paste0("$",formatC(sz$usd,format="f",digits=0,big.mark=",")," / ",sz$coins," coins") else "No position")),
+          div(class="tp-meta-item",
+            div(class="tp-meta-lbl","Fees+Slip (RT)"),
+            div(class="tp-meta-val", if(cost_rt>0) paste0("$",formatC(cost_rt,format="f",digits=2)," (",round(ROUND_TRIP*100,2),"%)") else "—"))
+        )
+      },
 
       notes_ui,
 
@@ -957,6 +1131,89 @@ server <- function(input, output, session) {
         div(class="tp-invalidation", paste0("Invalidation: ", tp$invalidation))
       else NULL
     )
+  })
+
+  # ---- Position tracker ----
+  output$position_tracker<-renderUI({
+    pos <- rv$pos
+    cur_px <- sig()$cur_px
+
+    state_col <- switch(pos$state, "FLAT"="#94a3b8", "PENDING"="#f59e0b", "OPEN"="#3b82f6", "#94a3b8")
+    state_icon <- switch(pos$state, "FLAT"="—", "PENDING"="⏳", "OPEN"="▶", "—")
+
+    header <- div(style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;",
+      div(style=paste0("font-size:13px;font-weight:700;color:",state_col,";"),
+          paste(state_icon, pos$state, if(!is.na(pos$direction)) pos$direction else "")),
+      div(style="font-size:11px;color:#94a3b8;",
+          paste0("Account: $",formatC(ACCOUNT_SIZE + pos$realized_pnl, format="f", digits=2, big.mark=",")))
+    )
+
+    body <- if(pos$state == "PENDING") {
+      ttl <- max(0, round(300 - (as.numeric(Sys.time()) - pos$pending_at)))
+      div(
+        div(style="font-size:11px;color:#64748b;margin-bottom:6px;",
+            paste0("Waiting for fill — ", pos$pending_dir, " @ $", fp(pos$pending_entry))),
+        div(class="tp-grid",
+          div(class="tp-box", div(class="tp-box-lbl","Entry"), div(class="tp-box-val", fp(pos$pending_entry))),
+          div(class="tp-box", div(class="tp-box-lbl","Size"), div(class="tp-box-val", paste0("$",pos$pending_size_usd))),
+          div(class="tp-box", div(class="tp-box-lbl","Stop"), div(class="tp-box-val",style="color:#dc2626;", fp(pos$pending_stop))),
+          div(class="tp-box", div(class="tp-box-lbl","Expires"), div(class="tp-box-val", paste0(ttl,"s")))
+        ),
+        div(style="font-size:10px;color:#94a3b8;margin-top:4px;",
+            paste0("Score at signal: ", round(pos$pending_score,1), " | Will cancel if signal flips or 5min expires"))
+      )
+    } else if(pos$state == "OPEN") {
+      pnl <- calc_pnl(pos, cur_px)
+      elapsed <- round((as.numeric(Sys.time()) - pos$opened_at) / 60, 0)
+      remaining <- max(0, round((pos$horizon_end - as.numeric(Sys.time())) / 60, 0))
+      pnl_col <- if(pnl$net_usd >= 0) "#16a34a" else "#dc2626"
+      tp1_hit <- if(pos$direction=="LONG") cur_px >= pos$tp1_px else cur_px <= pos$tp1_px
+      div(
+        div(style="display:flex;justify-content:space-between;align-items:baseline;",
+          div(style="font-size:12px;font-weight:600;color:#334155;",
+              paste0(pos$direction, " ", pos$size_coins, " HYPE @ $", fp(pos$entry_px))),
+          div(style=paste0("font-size:16px;font-weight:700;color:",pnl_col,";"),
+              paste0(ifelse(pnl$net_usd>=0,"+",""), "$", formatC(abs(pnl$net_usd),format="f",digits=2),
+                     " (", ifelse(pnl$net_pct>=0,"+",""), pnl$net_pct, "%)"))
+        ),
+        div(class="tp-grid", style="margin-top:8px;",
+          div(class="tp-box", div(class="tp-box-lbl","Current"), div(class="tp-box-val", fp(cur_px))),
+          div(class="tp-box", div(class="tp-box-lbl","Stop"), div(class="tp-box-val",style="color:#dc2626;", fp(pos$stop_px))),
+          div(class="tp-box", div(class="tp-box-lbl", if(tp1_hit)"T1 ✓" else "Target 1"),
+              div(class="tp-box-val",style=paste0("color:",if(tp1_hit)"#16a34a" else "#64748b",";"), fp(pos$tp1_px))),
+          div(class="tp-box", div(class="tp-box-lbl","Target 2"), div(class="tp-box-val",style="color:#16a34a;", fp(pos$tp2_px)))
+        ),
+        div(style="display:flex;justify-content:space-between;margin-top:6px;font-size:10px;color:#94a3b8;",
+          span(paste0("Fees: $", pnl$fees)),
+          span(paste0(elapsed, "min in | ", remaining, "min left")),
+          span(paste0("Gross: $", formatC(pnl$usd,format="f",digits=2)))
+        )
+      )
+    } else {
+      div(style="font-size:11px;color:#94a3b8;", "No active position — waiting for signal alignment")
+    }
+
+    trade_log_ui <- if(length(pos$trade_log) > 0) {
+      recent <- rev(pos$trade_log)
+      if(length(recent) > 5) recent <- recent[1:5]
+      rows <- lapply(recent, function(t) {
+        col <- if(t$pnl_usd >= 0) "#16a34a" else "#dc2626"
+        div(style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px solid #f1f5f9;font-size:10px;",
+          span(style="color:#64748b;width:50px;", t$dir),
+          span(style="color:#334155;", paste0("$",fp(t$entry)," → $",fp(t$exit))),
+          span(style=paste0("font-weight:600;color:",col,";"),
+               paste0(ifelse(t$pnl_usd>=0,"+",""),"$",formatC(abs(t$pnl_usd),format="f",digits=2))),
+          span(style="color:#94a3b8;width:60px;text-align:right;", paste0(t$duration_m,"m | ",t$reason))
+        )
+      })
+      div(style="margin-top:10px;border-top:1px solid #e2e8f0;padding-top:8px;",
+        div(style="font-size:10px;color:#94a3b8;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;",
+            paste0("Trade Log (P&L: $", formatC(pos$realized_pnl,format="f",digits=2), ")")),
+        do.call(div, rows)
+      )
+    } else NULL
+
+    tagList(header, body, trade_log_ui)
   })
 
   # ---- Signal component list ----
