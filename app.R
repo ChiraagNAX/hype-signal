@@ -57,24 +57,21 @@ fetch_wrap <- function(expr) {
   }, error=function(e) list(ok=FALSE, data=NULL, fetched_at=t0, error_msg=conditionMessage(e)))
 }
 
+.cex_mem <- list(data=NULL, at=0)
 read_cex_cache <- function() {
-  tryCatch({
+  now <- as.numeric(Sys.time())
+  if(!is.null(.cex_mem$data) && (now - .cex_mem$at) < 60) return(.cex_mem$data)
+  cache <- tryCatch({
     tmp <- tempfile(fileext=".rds")
     r <- GET("https://raw.githubusercontent.com/ChiraagNAX/hype-signal/main/data/cex_cache.rds",
              write_disk(tmp,overwrite=TRUE), timeout(5))
-    if(status_code(r)==200) {
-      cache <- readRDS(tmp)
-      age <- as.numeric(Sys.time()) - cache$fetched_at
-      if(age <= CEX_CACHE_MAX_AGE) return(cache)
-    }
+    if(status_code(r)==200) readRDS(tmp) else NULL
   }, error=function(e) NULL)
-  tryCatch({
-    if(!file.exists(CEX_CACHE)) return(NULL)
-    cache <- readRDS(CEX_CACHE)
-    age <- as.numeric(Sys.time()) - cache$fetched_at
-    if(age <= CEX_CACHE_MAX_AGE) return(cache)
-    cache
+  if(is.null(cache)) cache <- tryCatch({
+    if(file.exists(CEX_CACHE)) readRDS(CEX_CACHE) else NULL
   }, error=function(e) NULL)
+  if(!is.null(cache)) { .cex_mem$data <<- cache; .cex_mem$at <<- now }
+  cache
 }
 
 safe_get <- function(url, query=NULL) {
