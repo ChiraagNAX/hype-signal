@@ -58,6 +58,7 @@ fetch_wrap <- function(expr) {
   }, error=function(e) list(ok=FALSE, data=NULL, fetched_at=t0, error_msg=conditionMessage(e)))
 }
 
+ON_SHINYAPPS <- Sys.getenv("R_CONFIG_ACTIVE","") == "shinyapps" || file.exists("/srv/connect/apps")
 .cex_mem <- list(data=NULL, at=0)
 read_cex_cache <- function() {
   now <- as.numeric(Sys.time())
@@ -203,31 +204,42 @@ fetch_hl_trades <- function() {
 # FETCHERS — BINANCE
 # =============================================================================
 
-fetch_bn_spot <- function() {
-  r <- fetch_wrap({
+cex_cache_wrap <- function(live_fn, cache_key) {
+  if(ON_SHINYAPPS) {
+    cache<-read_cex_cache()
+    if(!is.null(cache)&&!is.null(cache[[cache_key]]))
+      return(list(ok=TRUE,data=cache[[cache_key]],fetched_at=cache$fetched_at,error_msg=NA_character_))
+    return(list(ok=FALSE,data=NULL,fetched_at=as.numeric(Sys.time()),error_msg="no cache"))
+  }
+  r<-live_fn()
+  if(!r$ok) { cache<-read_cex_cache(); if(!is.null(cache)&&!is.null(cache[[cache_key]]))
+    r<-list(ok=TRUE,data=cache[[cache_key]],fetched_at=cache$fetched_at,error_msg=NA_character_) }
+  r
+}
+
+fetch_bn_spot <- function() cex_cache_wrap(function() fetch_wrap({
     res<-safe_get(paste0(BINANCE_SPOT,"/ticker/24hr"),list(symbol=BN_SPOT_SYM),tout=CEX_TIMEOUT)
     if(is.null(res)) return(NULL)
     list(price=as.numeric(res$lastPrice),change_pct=as.numeric(res$priceChangePercent),
          volume=as.numeric(res$quoteVolume))
-  })
-  if(!r$ok) { cache<-read_cex_cache(); if(!is.null(cache)&&!is.null(cache$bn_spot))
-    r<-list(ok=TRUE,data=cache$bn_spot,fetched_at=cache$fetched_at,error_msg=NA_character_) }
-  r
-}
+  }), "bn_spot")
 
-fetch_bn_premium_index <- function() {
-  r <- fetch_wrap({
+fetch_bn_premium_index <- function() cex_cache_wrap(function() fetch_wrap({
     res<-safe_get(paste0(BINANCE_PERP,"/premiumIndex"),list(symbol=BN_PERP_SYM),tout=CEX_TIMEOUT)
     if(is.null(res)) return(NULL)
     list(mark_px=as.numeric(res$markPrice), index_px=as.numeric(res$indexPrice),
          funding_rate=as.numeric(res$lastFundingRate), next_fund_time=as.numeric(res$nextFundingTime))
-  })
-  if(!r$ok) { cache<-read_cex_cache(); if(!is.null(cache)&&!is.null(cache$bn_prem))
-    r<-list(ok=TRUE,data=cache$bn_prem,fetched_at=cache$fetched_at,error_msg=NA_character_) }
-  r
-}
+  }), "bn_prem")
 
 fetch_bn_perp <- function() {
+  if(ON_SHINYAPPS) {
+    cache<-read_cex_cache()
+    if(!is.null(cache)&&!is.null(cache$bn_perp)) {
+      d<-cache$bn_perp; d$oi_base<-if(!is.null(cache$bn_oi_base)) cache$bn_oi_base else NA_real_
+      return(list(ok=TRUE,data=d,fetched_at=cache$fetched_at,error_msg=NA_character_))
+    }
+    return(list(ok=FALSE,data=NULL,fetched_at=as.numeric(Sys.time()),error_msg="no cache"))
+  }
   r <- fetch_wrap({
     t<-safe_get(paste0(BINANCE_PERP,"/ticker/24hr"),list(symbol=BN_PERP_SYM),tout=CEX_TIMEOUT)
     oi<-safe_get(paste0(BINANCE_PERP,"/openInterest"),list(symbol=BN_PERP_SYM),tout=CEX_TIMEOUT)
@@ -242,18 +254,13 @@ fetch_bn_perp <- function() {
   r
 }
 
-fetch_bn_perp_book <- function(limit=25) {
-  r <- fetch_wrap({
+fetch_bn_perp_book <- function(limit=25) cex_cache_wrap(function() fetch_wrap({
     res<-safe_get(paste0(BINANCE_PERP,"/depth"),list(symbol=BN_PERP_SYM,limit=limit),tout=CEX_TIMEOUT)
     if(is.null(res)) return(NULL)
     list(bids=data.frame(price=as.numeric(sapply(res$bids,`[[`,1)),size=as.numeric(sapply(res$bids,`[[`,2)),side="bid",stringsAsFactors=FALSE),
          asks=data.frame(price=as.numeric(sapply(res$asks,`[[`,1)),size=as.numeric(sapply(res$asks,`[[`,2)),side="ask",stringsAsFactors=FALSE),
          n_bid_levels=length(res$bids),n_ask_levels=length(res$asks))
-  })
-  if(!r$ok) { cache<-read_cex_cache(); if(!is.null(cache)&&!is.null(cache$bn_ob))
-    r<-list(ok=TRUE,data=cache$bn_ob,fetched_at=cache$fetched_at,error_msg=NA_character_) }
-  r
-}
+  }), "bn_ob")
 
 fetch_bn_perp_candles <- function(interval="5m",limit=300) {
   fetch_wrap({
@@ -270,8 +277,7 @@ fetch_bn_perp_candles <- function(interval="5m",limit=300) {
 # FETCHERS — BYBIT
 # =============================================================================
 
-fetch_bybit_perp <- function() {
-  r <- fetch_wrap({
+fetch_bybit_perp <- function() cex_cache_wrap(function() fetch_wrap({
     res<-safe_get(paste0(BYBIT_BASE,"/market/tickers"),list(category="linear",symbol=BYBIT_SYM),tout=CEX_TIMEOUT)
     if(is.null(res)||!length(res$result$list)) return(NULL)
     it<-res$result$list[[1]]
@@ -279,14 +285,9 @@ fetch_bybit_perp <- function() {
          change_pct=suppressWarnings(as.numeric(it$price24hPcnt)),
          oi_usd=suppressWarnings(as.numeric(it$openInterestValue)),
          funding_rate=suppressWarnings(as.numeric(it$fundingRate)))
-  })
-  if(!r$ok) { cache<-read_cex_cache(); if(!is.null(cache)&&!is.null(cache$bybit_perp))
-    r<-list(ok=TRUE,data=cache$bybit_perp,fetched_at=cache$fetched_at,error_msg=NA_character_) }
-  r
-}
+  }), "bybit_perp")
 
-fetch_bybit_perp_book <- function(limit=25) {
-  r <- fetch_wrap({
+fetch_bybit_perp_book <- function(limit=25) cex_cache_wrap(function() fetch_wrap({
     res<-safe_get(paste0(BYBIT_BASE,"/market/orderbook"),list(category="linear",symbol=BYBIT_SYM,limit=limit),tout=CEX_TIMEOUT)
     if(is.null(res)||is.null(res$result)) return(NULL)
     b<-res$result$b; a<-res$result$a
@@ -294,11 +295,7 @@ fetch_bybit_perp_book <- function(limit=25) {
     list(bids=data.frame(price=as.numeric(sapply(b,`[[`,1)),size=as.numeric(sapply(b,`[[`,2)),side="bid",stringsAsFactors=FALSE),
          asks=data.frame(price=as.numeric(sapply(a,`[[`,1)),size=as.numeric(sapply(a,`[[`,2)),side="ask",stringsAsFactors=FALSE),
          n_bid_levels=length(b),n_ask_levels=length(a))
-  })
-  if(!r$ok) { cache<-read_cex_cache(); if(!is.null(cache)&&!is.null(cache$bybit_ob))
-    r<-list(ok=TRUE,data=cache$bybit_ob,fetched_at=cache$fetched_at,error_msg=NA_character_) }
-  r
-}
+  }), "bybit_ob")
 
 # =============================================================================
 # ANALYTICS
