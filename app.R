@@ -36,6 +36,7 @@ FUNDING_MS <- 60000
 CANDLE_MS  <- 120000
 
 API_TIMEOUT  <- 8
+CEX_TIMEOUT  <- 3
 STALE_WARN_S <- 30
 STALE_ERR_S  <- 120
 CEX_CACHE    <- "data/cex_cache.rds"
@@ -74,9 +75,9 @@ read_cex_cache <- function() {
   cache
 }
 
-safe_get <- function(url, query=NULL) {
+safe_get <- function(url, query=NULL, tout=API_TIMEOUT) {
   tryCatch({
-    r <- GET(url, query=query, timeout(API_TIMEOUT))
+    r <- GET(url, query=query, timeout(tout))
     if(status_code(r)==200) fromJSON(content(r,"text",encoding="UTF-8"),simplifyVector=FALSE) else NULL
   }, error=function(e) NULL)
 }
@@ -204,7 +205,7 @@ fetch_hl_trades <- function() {
 
 fetch_bn_spot <- function() {
   r <- fetch_wrap({
-    res<-safe_get(paste0(BINANCE_SPOT,"/ticker/24hr"),list(symbol=BN_SPOT_SYM))
+    res<-safe_get(paste0(BINANCE_SPOT,"/ticker/24hr"),list(symbol=BN_SPOT_SYM),tout=CEX_TIMEOUT)
     if(is.null(res)) return(NULL)
     list(price=as.numeric(res$lastPrice),change_pct=as.numeric(res$priceChangePercent),
          volume=as.numeric(res$quoteVolume))
@@ -216,7 +217,7 @@ fetch_bn_spot <- function() {
 
 fetch_bn_premium_index <- function() {
   r <- fetch_wrap({
-    res<-safe_get(paste0(BINANCE_PERP,"/premiumIndex"),list(symbol=BN_PERP_SYM))
+    res<-safe_get(paste0(BINANCE_PERP,"/premiumIndex"),list(symbol=BN_PERP_SYM),tout=CEX_TIMEOUT)
     if(is.null(res)) return(NULL)
     list(mark_px=as.numeric(res$markPrice), index_px=as.numeric(res$indexPrice),
          funding_rate=as.numeric(res$lastFundingRate), next_fund_time=as.numeric(res$nextFundingTime))
@@ -228,8 +229,8 @@ fetch_bn_premium_index <- function() {
 
 fetch_bn_perp <- function() {
   r <- fetch_wrap({
-    t<-safe_get(paste0(BINANCE_PERP,"/ticker/24hr"),list(symbol=BN_PERP_SYM))
-    oi<-safe_get(paste0(BINANCE_PERP,"/openInterest"),list(symbol=BN_PERP_SYM))
+    t<-safe_get(paste0(BINANCE_PERP,"/ticker/24hr"),list(symbol=BN_PERP_SYM),tout=CEX_TIMEOUT)
+    oi<-safe_get(paste0(BINANCE_PERP,"/openInterest"),list(symbol=BN_PERP_SYM),tout=CEX_TIMEOUT)
     if(is.null(t)&&is.null(oi)) return(NULL)
     list(price=if(!is.null(t)) as.numeric(t$lastPrice) else NA_real_,
          change_pct=if(!is.null(t)) as.numeric(t$priceChangePercent) else NA_real_,
@@ -243,7 +244,7 @@ fetch_bn_perp <- function() {
 
 fetch_bn_perp_book <- function(limit=25) {
   r <- fetch_wrap({
-    res<-safe_get(paste0(BINANCE_PERP,"/depth"),list(symbol=BN_PERP_SYM,limit=limit))
+    res<-safe_get(paste0(BINANCE_PERP,"/depth"),list(symbol=BN_PERP_SYM,limit=limit),tout=CEX_TIMEOUT)
     if(is.null(res)) return(NULL)
     list(bids=data.frame(price=as.numeric(sapply(res$bids,`[[`,1)),size=as.numeric(sapply(res$bids,`[[`,2)),side="bid",stringsAsFactors=FALSE),
          asks=data.frame(price=as.numeric(sapply(res$asks,`[[`,1)),size=as.numeric(sapply(res$asks,`[[`,2)),side="ask",stringsAsFactors=FALSE),
@@ -256,7 +257,7 @@ fetch_bn_perp_book <- function(limit=25) {
 
 fetch_bn_perp_candles <- function(interval="5m",limit=300) {
   fetch_wrap({
-    res<-safe_get(paste0(BINANCE_PERP,"/klines"),list(symbol=BN_PERP_SYM,interval=interval,limit=limit))
+    res<-safe_get(paste0(BINANCE_PERP,"/klines"),list(symbol=BN_PERP_SYM,interval=interval,limit=limit),tout=CEX_TIMEOUT)
     if(is.null(res)) return(NULL)
     data.frame(time=as.POSIXct(sapply(res,function(x)as.numeric(x[[1]]))/1000,origin="1970-01-01",tz="UTC"),
                open=as.numeric(sapply(res,function(x)x[[2]])),high=as.numeric(sapply(res,function(x)x[[3]])),
@@ -271,7 +272,7 @@ fetch_bn_perp_candles <- function(interval="5m",limit=300) {
 
 fetch_bybit_perp <- function() {
   r <- fetch_wrap({
-    res<-safe_get(paste0(BYBIT_BASE,"/market/tickers"),list(category="linear",symbol=BYBIT_SYM))
+    res<-safe_get(paste0(BYBIT_BASE,"/market/tickers"),list(category="linear",symbol=BYBIT_SYM),tout=CEX_TIMEOUT)
     if(is.null(res)||!length(res$result$list)) return(NULL)
     it<-res$result$list[[1]]
     list(price=suppressWarnings(as.numeric(it$lastPrice)),
@@ -286,7 +287,7 @@ fetch_bybit_perp <- function() {
 
 fetch_bybit_perp_book <- function(limit=25) {
   r <- fetch_wrap({
-    res<-safe_get(paste0(BYBIT_BASE,"/market/orderbook"),list(category="linear",symbol=BYBIT_SYM,limit=limit))
+    res<-safe_get(paste0(BYBIT_BASE,"/market/orderbook"),list(category="linear",symbol=BYBIT_SYM,limit=limit),tout=CEX_TIMEOUT)
     if(is.null(res)||is.null(res$result)) return(NULL)
     b<-res$result$b; a<-res$result$a
     if(!length(b)||!length(a)) return(NULL)
