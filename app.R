@@ -39,7 +39,7 @@ API_TIMEOUT  <- 8
 STALE_WARN_S <- 30
 STALE_ERR_S  <- 120
 CEX_CACHE    <- "data/cex_cache.rds"
-CEX_CACHE_MAX_AGE <- 600  # 10 min max staleness for cached data
+CEX_CACHE_MAX_AGE <- 86400
 
 # =============================================================================
 # HTTP HELPERS
@@ -59,10 +59,20 @@ fetch_wrap <- function(expr) {
 
 read_cex_cache <- function() {
   tryCatch({
+    tmp <- tempfile(fileext=".rds")
+    r <- GET("https://raw.githubusercontent.com/ChiraagNAX/hype-signal/main/data/cex_cache.rds",
+             write_disk(tmp,overwrite=TRUE), timeout(5))
+    if(status_code(r)==200) {
+      cache <- readRDS(tmp)
+      age <- as.numeric(Sys.time()) - cache$fetched_at
+      if(age <= CEX_CACHE_MAX_AGE) return(cache)
+    }
+  }, error=function(e) NULL)
+  tryCatch({
     if(!file.exists(CEX_CACHE)) return(NULL)
     cache <- readRDS(CEX_CACHE)
     age <- as.numeric(Sys.time()) - cache$fetched_at
-    if(age > CEX_CACHE_MAX_AGE) return(NULL)
+    if(age <= CEX_CACHE_MAX_AGE) return(cache)
     cache
   }, error=function(e) NULL)
 }
