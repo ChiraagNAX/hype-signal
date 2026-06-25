@@ -43,13 +43,14 @@ CEX_CACHE    <- "data/cex_cache.rds"
 CEX_CACHE_MAX_AGE <- 86400
 
 # Account & fee model
-ACCOUNT_SIZE <- 10000
+ACCOUNT_SIZE <- 100000
 MAX_RISK_PCT <- 0.02
 FEE_MAKER    <- 0.0005
 FEE_TAKER    <- 0.0006
 SLIPPAGE_EST <- 0.0003
 ROUND_TRIP   <- FEE_MAKER + FEE_TAKER + 2*SLIPPAGE_EST
 MAX_POS_PCT  <- 0.20
+TRADE_LOG_FILE <- "data/trade_log.rds"
 
 # =============================================================================
 # HTTP HELPERS
@@ -615,12 +616,14 @@ build_trade_plan <- function(sig_result, hl_ctx, ob_result) {
 # =============================================================================
 
 new_position <- function() {
+  saved <- load_trade_log()
+  realized <- if(length(saved)) sum(sapply(saved, function(t) t$pnl_usd)) else 0
   list(state="FLAT", direction=NA, entry_px=NA, size_usd=NA, size_coins=NA,
        stop_px=NA, tp1_px=NA, tp2_px=NA, opened_at=NA, horizon_end=NA,
        pending_entry=NA, pending_dir=NA, pending_stop=NA, pending_tp1=NA,
        pending_tp2=NA, pending_size_usd=NA, pending_size_coins=NA,
        pending_score=NA, pending_at=NA, pending_horizon_s=NA,
-       realized_pnl=0, trade_log=list())
+       realized_pnl=realized, trade_log=saved)
 }
 
 calc_position_size <- function(conviction, px, stop_px) {
@@ -739,6 +742,7 @@ update_position <- function(pos, sig_result, tplan, cur_px) {
                     opened=pos$opened_at, closed=now,
                     duration_m=round((now - pos$opened_at)/60,1))
       pos$trade_log <- c(pos$trade_log, list(trade))
+      save_trade_log(pos$trade_log)
       pos$realized_pnl <- pos$realized_pnl + pnl$net_usd
       pos$state <- "FLAT"
       pos$direction <- NA; pos$entry_px <- NA; pos$size_usd <- NA
@@ -748,6 +752,37 @@ update_position <- function(pos, sig_result, tplan, cur_px) {
     return(pos)
   }
   pos
+}
+
+load_trade_log <- function() {
+  tryCatch({
+    if(file.exists(TRADE_LOG_FILE)) readRDS(TRADE_LOG_FILE) else list()
+  }, error=function(e) list())
+}
+
+save_trade_log <- function(log) {
+  tryCatch(saveRDS(log, TRADE_LOG_FILE), error=function(e) NULL)
+}
+
+calc_performance <- function(trades, hours=NULL) {
+  now <- as.numeric(Sys.time())
+  if(!is.null(hours)) trades <- Filter(function(t) (now - t$closed) <= hours*3600, trades)
+  n <- length(trades)
+  if(n == 0) return(list(n=0, pnl=0, fees=0, wins=0, losses=0, win_rate=0,
+                          avg_pnl=0, best=0, worst=0, avg_duration=0, expectancy=0))
+  pnls <- sapply(trades, function(t) t$pnl_usd)
+  fees <- sapply(trades, function(t) t$fees)
+  durations <- sapply(trades, function(t) t$duration_m)
+  wins <- sum(pnls > 0); losses <- sum(pnls <= 0)
+  avg_win <- if(wins>0) mean(pnls[pnls>0]) else 0
+  avg_loss <- if(losses>0) mean(abs(pnls[pnls<=0])) else 0
+  win_rate <- if(n>0) wins/n else 0
+  expectancy <- win_rate * avg_win - (1-win_rate) * avg_loss
+  list(n=n, pnl=sum(pnls), fees=sum(fees), wins=wins, losses=losses,
+       win_rate=round(win_rate*100,1), avg_pnl=round(mean(pnls),2),
+       best=round(max(pnls),2), worst=round(min(pnls),2),
+       avg_duration=round(mean(durations),1), expectancy=round(expectancy,2),
+       pnl_pct=round(sum(pnls)/ACCOUNT_SIZE*100,3))
 }
 
 # =============================================================================
@@ -891,8 +926,12 @@ ui <- page_fluid(
         uiOutput("trade_plan")
       ),
       div(class="card", style="padding:16px; margin-top:8px;",
-        div(class="sh", "Position Tracker ($10K Account)"),
+        div(class="sh", "Position Tracker ($100K Account)"),
         uiOutput("position_tracker")
+      ),
+      div(class="card", style="padding:16px; margin-top:8px;",
+        div(class="sh", "Performance"),
+        uiOutput("performance_panel")
       )
     ),
 
@@ -1214,6 +1253,58 @@ server <- function(input, output, session) {
     } else NULL
 
     tagList(header, body, trade_log_ui)
+  })
+
+  # ---- Performance panel ----
+  output$performance_panel<-renderUI({
+    pos <- rv$pos
+    trades <- pos$trade_log
+    if(length(trades) == 0) return(div(style="font-size:11px;color:#94a3b8;padding:8px 0;",
+      "No completed trades yet — performance will appear here"))
+
+    horizons <- list(
+      list(label="1H", hours=1), list(label="4H", hours=4),
+      list(label="24H", hours=24), list(label="7D", hours=168),
+      list(label="ALL", hours=NULL)
+    )
+
+    perf_row <- function(h) {
+      p <- calc_performance(trades, h$hours)
+      if(p$n == 0) return(NULL)
+      pnl_col <- if(p$pnl >= 0) "#16a34a" else "#dc2626"
+      div(style="display:flex;align-items:center;justify-content:space-between;padding:5px 0;border-bottom:1px solid #f1f5f9;font-size:11px;",
+        span(style="font-weight:600;color:#334155;width:35px;", h$label),
+        span(style="color:#64748b;", paste0(p$n," trades")),
+        span(style="color:#64748b;", paste0(p$win_rate,"% win")),
+        span(style=paste0("font-weight:600;color:",pnl_col,";"),
+             paste0(ifelse(p$pnl>=0,"+",""),"$",formatC(abs(p$pnl),format="f",digits=2,big.mark=","))),
+        span(style=paste0("color:",pnl_col,";"), paste0(ifelse(p$pnl_pct>=0,"+",""),p$pnl_pct,"%")),
+        span(style="color:#94a3b8;", paste0("avg ",p$avg_duration,"m"))
+      )
+    }
+
+    rows <- Filter(Negate(is.null), lapply(horizons, perf_row))
+    if(length(rows) == 0) return(div(style="font-size:11px;color:#94a3b8;", "No trades in selected horizons"))
+
+    all_perf <- calc_performance(trades, NULL)
+    summary <- div(style="margin-top:8px;padding-top:8px;border-top:1px solid #e2e8f0;font-size:10px;color:#64748b;display:flex;justify-content:space-between;",
+      span(paste0("Best: +$",all_perf$best)),
+      span(paste0("Worst: $",all_perf$worst)),
+      span(paste0("Fees paid: $",formatC(all_perf$fees,format="f",digits=2))),
+      span(paste0("Expectancy: $",all_perf$expectancy,"/trade"))
+    )
+
+    equity <- ACCOUNT_SIZE + pos$realized_pnl
+    equity_col <- if(pos$realized_pnl >= 0) "#16a34a" else "#dc2626"
+    eq_bar <- div(style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px;",
+      div(style="font-size:12px;color:#334155;font-weight:600;",
+          paste0("Equity: $",formatC(equity,format="f",digits=2,big.mark=","))),
+      div(style=paste0("font-size:11px;font-weight:600;color:",equity_col,";"),
+          paste0(ifelse(pos$realized_pnl>=0,"+",""),"$",formatC(abs(pos$realized_pnl),format="f",digits=2),
+                 " (",round(pos$realized_pnl/ACCOUNT_SIZE*100,3),"%)"))
+    )
+
+    tagList(eq_bar, do.call(div, rows), summary)
   })
 
   # ---- Signal component list ----
