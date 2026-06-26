@@ -52,6 +52,16 @@ ROUND_TRIP   <- FEE_MAKER + FEE_TAKER + 2*SLIPPAGE_EST
 MAX_POS_PCT  <- 0.20
 TRADE_LOG_FILE <- "data/trade_log.rds"
 
+# Quant params
+EWMA_ALPHA     <- 0.35    # composite smoothing (higher = more responsive)
+VOL_BARS       <- 48      # 5m bars for realized vol (~4h lookback)
+ATR_N          <- 14      # ATR period (5m bars)
+ATR_STOP_MULT  <- 1.6     # stop distance = k * ATR
+ATR_TP1_MULT   <- 1.4     # target 1 = k * ATR
+ATR_TP2_MULT   <- 2.8     # target 2 = k * ATR
+EDGE_MARGIN    <- 1.5     # require E[move] >= margin * round-trip friction to trade
+FUNDING_PERIOD_H <- 8     # funding accrues every 8h on HL
+
 # =============================================================================
 # HTTP HELPERS
 # =============================================================================
@@ -330,7 +340,50 @@ calc_ob_imbalance <- function(books, pct=0.005) {
   bv<-sum(agg_b$pb[agg_b$pb>=mid*(1-pct)]*agg_b$size[agg_b$pb>=mid*(1-pct)],na.rm=TRUE)
   av<-sum(agg_a$pb[agg_a$pb<=mid*(1+pct)]*agg_a$size[agg_a$pb<=mid*(1+pct)],na.rm=TRUE)
   tot<-bv+av; n_ok<-sum(sapply(books,function(b)!is.null(b$data)))
-  list(imb=if(tot>0) bv/tot else 0.5, bid_notl=bv, ask_notl=av, mid=mid, n_venues=n_ok)
+  bid_ladder<-agg_b[order(-agg_b$pb),]; ask_ladder<-agg_a[order(agg_a$pb),]
+  list(imb=if(tot>0) bv/tot else 0.5, bid_notl=bv, ask_notl=av, mid=mid, n_venues=n_ok,
+       bid_ladder=bid_ladder, ask_ladder=ask_ladder)
+}
+
+# Annualized realized vol from log returns of 5m candles
+calc_realized_vol <- function(df, bars=VOL_BARS) {
+  if(is.null(df)||nrow(df)<bars+1) return(NA_real_)
+  cl<-tail(df$close,bars+1); cl<-cl[cl>0]
+  if(length(cl)<3) return(NA_real_)
+  rets<-diff(log(cl))
+  per_bar<-sd(rets,na.rm=TRUE)
+  if(is.na(per_bar)) return(NA_real_)
+  bars_per_year<-(365*24*60)/5
+  list(per_bar=per_bar, annual=per_bar*sqrt(bars_per_year), bar_min=5)
+}
+
+# Average True Range (price units) from 5m candles
+calc_atr <- function(df, n=ATR_N) {
+  if(is.null(df)||nrow(df)<n+1) return(NA_real_)
+  h<-df$high; l<-df$low; c<-df$close
+  pc<-c[-length(c)]; h<-h[-1]; l<-l[-1]
+  tr<-pmax(h-l, abs(h-pc), abs(l-pc), na.rm=TRUE)
+  mean(tail(tr,n),na.rm=TRUE)
+}
+
+# Walk an aggregated book ladder to estimate avg fill slippage vs mid for a given notional.
+# ladder: data.frame(pb=price, size=size) sorted best-first. Returns fraction (>=0) and fill ratio.
+walk_book_slippage <- function(ladder, notional_usd, mid) {
+  if(is.null(ladder)||nrow(ladder)==0||is.na(mid)||mid<=0||is.na(notional_usd)||notional_usd<=0)
+    return(list(slip=SLIPPAGE_EST, filled_frac=1, capped=FALSE))
+  remaining<-notional_usd; cost<-0; coins<-0
+  for(i in seq_len(nrow(ladder))) {
+    lvl_px<-ladder$pb[i]; lvl_notl<-ladder$pb[i]*ladder$size[i]
+    take<-min(remaining, lvl_notl)
+    coins<-coins + take/lvl_px; cost<-cost + take
+    remaining<-remaining - take
+    if(remaining<=0) break
+  }
+  filled<-notional_usd - remaining
+  if(filled<=0) return(list(slip=SLIPPAGE_EST, filled_frac=0, capped=TRUE))
+  avg_px<-cost/coins
+  slip<-abs(avg_px-mid)/mid
+  list(slip=slip, filled_frac=filled/notional_usd, capped=(remaining>0))
 }
 
 detect_candle_gaps <- function(df,interval) {
@@ -497,45 +550,37 @@ build_signal <- function(hl_ctx, hl_spot, bn_perp, bn_prem, bybit_perp,
 # TRADE PLAN BUILDER
 # =============================================================================
 
-build_trade_plan <- function(sig_result, hl_ctx, ob_result) {
+build_trade_plan <- function(sig_result, hl_ctx, ob_result, atr=NA_real_, rvol=NULL) {
   sc <- sig_result$score
   conf <- sig_result$confidence
   px <- sig_result$cur_px
   twaps <- sig_result$twap_levels
 
-  if(is.na(sc)||is.na(px)) return(list(
+  blank <- list(
     action="WAIT", action_col="#94a3b8", reason="Insufficient data to form a view.",
     entry="—", stop="—", tp1="—", tp2="—", invalidation="—",
-    horizon="—", sizing="—", conviction="None", edge_notes=list()
-  ))
+    horizon="—", sizing="—", conviction="None", edge_notes=list(),
+    entry_num=NA_real_, stop_num=NA_real_, tp1_num=NA_real_, tp2_num=NA_real_,
+    direction="FLAT", score=NA_real_, gated=FALSE, edge_frac=NA, friction_frac=NA,
+    funding_carry=NA, slip_in=NA, slip_out=NA, vol_regime="—", rr=NA)
+  if(is.na(sc)||is.na(px)) return(blank)
 
-  # Determine key levels from TWAPs
-  tw_vals <- unlist(twaps)
-  tw_below <- tw_vals[tw_vals < px]
-  tw_above <- tw_vals[tw_vals > px]
-  nearest_support <- if(length(tw_below)) max(tw_below) else px*0.99
-  nearest_resist  <- if(length(tw_above)) min(tw_above) else px*1.01
+  # --- Volatility basis: ATR in price units (fallback to % if no candles) ---
+  have_atr <- !is.na(atr) && atr > 0
+  atr_use <- if(have_atr) atr else px*0.006   # ~0.6% fallback
+  ann_vol <- if(!is.null(rvol)&&is.list(rvol)&&!is.na(rvol$annual)) rvol$annual else NA_real_
+  vol_regime <- if(is.na(ann_vol)) "unknown"
+    else if(ann_vol < 0.40) "low" else if(ann_vol < 0.80) "normal"
+    else if(ann_vol < 1.30) "elevated" else "high"
 
-  # OB midpoint as secondary reference
-  ob_mid <- if(!is.na(ob_result$mid)) ob_result$mid else px
-
-  # Funding
-  fr <- if(!is.null(hl_ctx$data)&&!is.na(hl_ctx$data$funding)) hl_ctx$data$funding else 0
-  fr_cost_8h <- abs(fr)*100
-
-  # Conviction level
+  # --- Conviction ---
   conviction <- if(abs(sc)>60&&conf>=80) "High"
     else if(abs(sc)>30&&conf>=60) "Medium"
     else if(abs(sc)>15&&conf>=50) "Low"
     else "None"
 
-  # Position sizing suggestion
-  sizing <- if(conviction=="High") "Full size (1x base)"
-    else if(conviction=="Medium") "Half size (0.5x base)"
-    else if(conviction=="Low") "Quarter size (0.25x base)"
-    else "No position — edge too thin"
-
-  # Horizon based on which TWAPs are driving
+  # --- Funding & horizon ---
+  fr <- if(!is.null(hl_ctx$data)&&!is.na(hl_ctx$data$funding)) hl_ctx$data$funding else 0
   comps <- sig_result$components
   twap_scores <- comps[grepl("TWAP",comps$Signal),]
   if(nrow(twap_scores)>0) {
@@ -545,70 +590,107 @@ build_trade_plan <- function(sig_result, hl_ctx, ob_result) {
       else if(grepl("15m",dominant)) "15-60 minutes"
       else "5-15 minutes"
   } else horizon <- "Unknown — no TWAP data"
+  horizon_h <- switch(gsub(" .*","",horizon), "4-12"=8, "1-4"=2.5, "15-60"=0.6, "5-15"=0.17, 2.5)
+  n_fund_periods <- horizon_h / FUNDING_PERIOD_H
 
-  # Edge notes — specific observations
-  notes <- list()
-  if(abs(fr)>0.0005) notes<-c(notes, paste0("Funding is ", if(fr>0)"positive (shorts get paid)" else "negative (longs get paid)", " at ", round(fr*100,4), "% per 8h"))
-  if(!is.na(ob_result$imb)) {
-    if(ob_result$imb>0.65) notes<-c(notes, "Strong bid-side orderbook support — sellers face a wall")
-    else if(ob_result$imb<0.35) notes<-c(notes, "Heavy ask-side pressure — bids are thin")
-  }
-  ob_skew <- if(!is.na(ob_result$imb)) ob_result$imb else 0.5
-
-  if(sc > 20) {
-    # BULLISH
-    entry_zone <- round(max(nearest_support, px*0.997), 4)
-    stop_loss  <- round(nearest_support*0.99, 4)
-    tp1        <- round(nearest_resist, 4)
-    tp2        <- round(px*1.02, 4)
-    invalidation <- paste0("Close below ", fp(stop_loss,2), " or funding flips heavily positive")
-    action <- if(sc>60) "STRONG LONG" else "LEAN LONG"
-    action_col <- if(sc>60) "#0a8754" else "#2d9d6a"
-    reason <- if(sc>60) "Multiple signals aligned bullish — TWAPs, flow, and structure all favour upside."
-      else "Modest bullish lean. Some supporting factors but conviction is mixed."
-  } else if(sc < -20) {
-    # BEARISH
-    entry_zone <- round(min(nearest_resist, px*1.003), 4)
-    stop_loss  <- round(nearest_resist*1.01, 4)
-    tp1        <- round(nearest_support, 4)
-    tp2        <- round(px*0.98, 4)
-    invalidation <- paste0("Close above ", fp(stop_loss,2), " or funding flips heavily negative")
-    action <- if(sc< -60) "STRONG SHORT" else "LEAN SHORT"
-    action_col <- if(sc< -60) "#b5291a" else "#c0522e"
-    reason <- if(sc< -60) "Multiple signals aligned bearish — TWAPs, flow, and structure all favour downside."
-      else "Modest bearish lean. Some factors supportive but not overwhelming."
+  # --- Directional levels (vol-scaled) ---
+  dir <- if(sc>20) "LONG" else if(sc< -20) "SHORT" else "FLAT"
+  if(dir=="LONG") {
+    entry_zone <- round(px - 0.25*atr_use, 4)
+    stop_loss  <- round(entry_zone - ATR_STOP_MULT*atr_use, 4)
+    tp1        <- round(entry_zone + ATR_TP1_MULT*atr_use, 4)
+    tp2        <- round(entry_zone + ATR_TP2_MULT*atr_use, 4)
+    funding_carry <- -fr * n_fund_periods          # longs pay positive funding
+  } else if(dir=="SHORT") {
+    entry_zone <- round(px + 0.25*atr_use, 4)
+    stop_loss  <- round(entry_zone + ATR_STOP_MULT*atr_use, 4)
+    tp1        <- round(entry_zone - ATR_TP1_MULT*atr_use, 4)
+    tp2        <- round(entry_zone - ATR_TP2_MULT*atr_use, 4)
+    funding_carry <- fr * n_fund_periods           # shorts receive positive funding
   } else {
-    # NEUTRAL — still show key levels as reference
-    entry_zone <- round(px, 4)
-    stop_loss  <- if(sc>=0) round(nearest_support*0.99, 4) else round(nearest_resist*1.01, 4)
-    tp1 <- round(nearest_resist, 4)
-    tp2 <- round(nearest_support, 4)
-    invalidation <- "Score moves beyond +/-20 for a directional entry"
-    action <- "NO TRADE"
-    action_col <- "#64748b"
-    reason <- "No clear directional edge. Signals are conflicting or flat. Wait for alignment."
-    sizing <- "No position — no edge"
+    entry_zone <- round(px,4)
+    stop_loss  <- round(px - ATR_STOP_MULT*atr_use,4)
+    tp1 <- round(px + ATR_TP1_MULT*atr_use,4); tp2 <- round(px - ATR_TP1_MULT*atr_use,4)
+    funding_carry <- 0
   }
 
-  is_neutral <- (action=="NO TRADE")
+  # --- Size, then walk the book for realistic slippage at that size ---
+  sz <- if(dir!="FLAT") calc_position_size(conviction, entry_zone, stop_loss) else list(usd=0,coins=0)
+  mid <- if(!is.na(ob_result$mid)) ob_result$mid else px
+  slip_in <- SLIPPAGE_EST; slip_out <- SLIPPAGE_EST; cap_warn <- FALSE
+  if(dir!="FLAT" && sz$usd>0 && !is.null(ob_result$ask_ladder)) {
+    if(dir=="LONG") {
+      wi <- walk_book_slippage(ob_result$ask_ladder, sz$usd, mid)   # buy into asks
+      wo <- walk_book_slippage(ob_result$bid_ladder, sz$usd, mid)   # sell into bids
+    } else {
+      wi <- walk_book_slippage(ob_result$bid_ladder, sz$usd, mid)
+      wo <- walk_book_slippage(ob_result$ask_ladder, sz$usd, mid)
+    }
+    slip_in <- wi$slip; slip_out <- wo$slip
+    cap_warn <- isTRUE(wi$capped) || isTRUE(wo$capped)
+  }
+
+  # --- Expected-value gate ---
+  reward_frac <- ATR_TP1_MULT*atr_use/px
+  risk_frac   <- ATR_STOP_MULT*atr_use/px
+  p_fav <- max(0.5, min(0.85, 0.5 + 0.35*(abs(sc)/100)*(conf/100)))
+  expectancy_frac <- p_fav*reward_frac - (1-p_fav)*risk_frac + funding_carry
+  friction_frac   <- FEE_MAKER + FEE_TAKER + slip_in + slip_out
+  net_edge_frac   <- expectancy_frac - friction_frac
+  rr <- if(risk_frac>0) round(reward_frac/risk_frac,2) else NA_real_
+
+  gated <- dir!="FLAT" && (expectancy_frac < EDGE_MARGIN*friction_frac || net_edge_frac <= 0)
+
+  # --- Notes ---
+  notes <- list()
+  if(have_atr) notes<-c(notes, paste0("ATR(5m)=$",fp(atr_use,3)," → stop ",round(ATR_STOP_MULT,1),
+                                       "×ATR (",fpct(risk_frac,2),"), vol regime: ",vol_regime))
+  if(abs(funding_carry)>0.0002) notes<-c(notes, paste0("Funding carry over hold: ",
+    if(funding_carry>0)"+" else "", fpct(funding_carry,3), " (", if(funding_carry>0)"credit" else "cost",")"))
+  notes<-c(notes, paste0("Est. slippage @ $",formatC(sz$usd,format="f",digits=0,big.mark=","),
+                         ": in ",fpct(slip_in,3),", out ",fpct(slip_out,3)))
+  if(cap_warn) notes<-c(notes, "⚠ Size exceeds visible book depth — expect worse fills / scale in")
+  if(!is.na(ob_result$imb)) {
+    if(ob_result$imb>0.65) notes<-c(notes, "Strong bid-side book support — sellers face a wall")
+    else if(ob_result$imb<0.35) notes<-c(notes, "Heavy ask-side pressure — bids thin")
+  }
+
+  if(dir=="FLAT") {
+    action<-"NO TRADE"; action_col<-"#64748b"
+    reason<-"No directional edge. Signals conflicting or flat. Wait for alignment."
+    sizing<-"No position — no edge"
+    invalidation<-"Score moves beyond +/-20 for a directional entry"
+  } else if(gated) {
+    action<-if(dir=="LONG")"LONG — BLOCKED" else "SHORT — BLOCKED"; action_col<-"#a16207"
+    reason<-paste0("Signal favours ",tolower(dir)," but expected edge (",fpct(expectancy_frac,3),
+                   ") doesn't clear friction (",fpct(friction_frac,3),"×",EDGE_MARGIN,
+                   "). Not worth the costs — standing aside.")
+    sizing<-paste0("Would be $",formatC(sz$usd,format="f",digits=0,big.mark=",")," — held back")
+    invalidation<-"Edge must exceed cost threshold to fire"
+  } else {
+    strong <- abs(sc)>60
+    action<-if(dir=="LONG"){ if(strong)"STRONG LONG" else "LEAN LONG" } else { if(strong)"STRONG SHORT" else "LEAN SHORT" }
+    action_col<-if(dir=="LONG"){ if(strong)"#0a8754" else "#2d9d6a" } else { if(strong)"#b5291a" else "#c0522e" }
+    reason<-paste0(if(strong)"Multiple signals aligned " else "Modest ", tolower(dir),
+                   " lean. Net edge ",fpct(net_edge_frac,3)," after costs, R:R ",rr,":1.")
+    sizing<-if(conviction=="High")"Full size (1x base)" else if(conviction=="Medium")"Half size (0.5x base)" else "Quarter size (0.25x base)"
+    invalidation<-paste0("Close beyond ", fp(stop_loss,2), " (",round(ATR_STOP_MULT,1),"×ATR) or signal flips")
+  }
+
+  is_passive <- dir=="FLAT" || gated
   list(action=action, action_col=action_col, reason=reason,
-       entry=if(is.numeric(entry_zone)) fp(entry_zone) else entry_zone,
-       stop=if(is.numeric(stop_loss)) fp(stop_loss) else stop_loss,
-       tp1=if(is.numeric(tp1)) fp(tp1) else tp1,
-       tp2=if(is.numeric(tp2)) fp(tp2) else tp2,
-       lbl_entry=if(is_neutral)"Current Price" else "Entry Zone",
-       lbl_stop=if(is_neutral)"Key Support" else "Stop Loss",
-       lbl_tp1=if(is_neutral)"Resistance" else "Target 1",
-       lbl_tp2=if(is_neutral) "Support" else "Target 2",
-       invalidation=invalidation,
-       horizon=horizon, sizing=sizing, conviction=conviction,
-       edge_notes=notes, fr_cost_8h=round(fr_cost_8h,4),
-       entry_num=if(is.numeric(entry_zone)) entry_zone else NA_real_,
-       stop_num=if(is.numeric(stop_loss)) stop_loss else NA_real_,
-       tp1_num=if(is.numeric(tp1)) tp1 else NA_real_,
-       tp2_num=if(is.numeric(tp2)) tp2 else NA_real_,
-       direction=if(sc>20) "LONG" else if(sc< -20) "SHORT" else "FLAT",
-       score=sc)
+       entry=fp(entry_zone), stop=fp(stop_loss), tp1=fp(tp1), tp2=fp(tp2),
+       lbl_entry=if(is_passive)"Reference" else "Entry Zone",
+       lbl_stop=if(dir=="FLAT")"Vol Stop" else "Stop Loss",
+       lbl_tp1=if(dir=="FLAT")"Upper Band" else "Target 1",
+       lbl_tp2=if(dir=="FLAT")"Lower Band" else "Target 2",
+       invalidation=invalidation, horizon=horizon, sizing=sizing, conviction=conviction,
+       edge_notes=notes,
+       entry_num=entry_zone, stop_num=stop_loss, tp1_num=tp1, tp2_num=tp2,
+       direction=if(gated) "FLAT" else dir, signal_dir=dir, score=sc,
+       gated=gated, edge_frac=expectancy_frac, net_edge_frac=net_edge_frac,
+       friction_frac=friction_frac, funding_carry=funding_carry,
+       slip_in=slip_in, slip_out=slip_out, vol_regime=vol_regime, rr=rr)
 }
 
 # =============================================================================
@@ -828,8 +910,13 @@ calc_performance <- function(trades, hours=NULL) {
   if(!is.null(hours)) trades <- Filter(function(t) (now - t$closed) <= hours*3600, trades)
   n <- length(trades)
   if(n == 0) return(list(n=0, pnl=0, fees=0, wins=0, losses=0, win_rate=0,
-                          avg_pnl=0, best=0, worst=0, avg_duration=0, expectancy=0))
+                          avg_pnl=0, best=0, worst=0, avg_duration=0, expectancy=0,
+                          pnl_pct=0, sharpe=NA, max_dd=0, profit_factor=NA))
+  # chronological for drawdown/Sharpe
+  ord <- order(sapply(trades, function(t) t$closed))
+  trades <- trades[ord]
   pnls <- sapply(trades, function(t) t$pnl_usd)
+  rets <- sapply(trades, function(t) t$pnl_pct/100)   # per-trade return on position notional
   fees <- sapply(trades, function(t) t$fees)
   durations <- sapply(trades, function(t) t$duration_m)
   wins <- sum(pnls > 0); losses <- sum(pnls <= 0)
@@ -837,11 +924,19 @@ calc_performance <- function(trades, hours=NULL) {
   avg_loss <- if(losses>0) mean(abs(pnls[pnls<=0])) else 0
   win_rate <- if(n>0) wins/n else 0
   expectancy <- win_rate * avg_win - (1-win_rate) * avg_loss
+  gross_win <- sum(pnls[pnls>0]); gross_loss <- abs(sum(pnls[pnls<=0]))
+  profit_factor <- if(gross_loss>0) round(gross_win/gross_loss,2) else NA
+  # Per-trade Sharpe (mean/sd of per-trade returns; not annualized — comparable across horizons)
+  sharpe <- if(n>=3 && sd(rets,na.rm=TRUE)>0) round(mean(rets,na.rm=TRUE)/sd(rets,na.rm=TRUE),2) else NA
+  # Max drawdown on cumulative $ equity curve
+  eq <- cumsum(pnls); peak <- cummax(eq); dd <- eq - peak
+  max_dd <- round(min(dd,0),2)
   list(n=n, pnl=sum(pnls), fees=sum(fees), wins=wins, losses=losses,
        win_rate=round(win_rate*100,1), avg_pnl=round(mean(pnls),2),
        best=round(max(pnls),2), worst=round(min(pnls),2),
        avg_duration=round(mean(durations),1), expectancy=round(expectancy,2),
-       pnl_pct=round(sum(pnls)/ACCOUNT_SIZE*100,3))
+       pnl_pct=round(sum(pnls)/ACCOUNT_SIZE*100,3),
+       sharpe=sharpe, max_dd=max_dd, profit_factor=profit_factor)
 }
 
 # =============================================================================
@@ -1049,7 +1144,8 @@ server <- function(input, output, session) {
     c_at=NA,
     prev_oi=NA_real_,
     last_upd=Sys.time(),
-    pos=new_position()
+    pos=new_position(),
+    score_ewma=NA_real_
   )
 
   t_price<-reactiveTimer(PRICE_MS)
@@ -1103,7 +1199,10 @@ server <- function(input, output, session) {
 
   trade_flow<-reactive(calc_trade_flow(rv$r_hl_trades$data))
 
-  sig<-reactive({
+  atr5<-reactive(calc_atr(if(!is.null(rv$c_hl_5m))rv$c_hl_5m$data else NULL))
+  rvol5<-reactive(calc_realized_vol(if(!is.null(rv$c_hl_5m))rv$c_hl_5m$data else NULL))
+
+  sig_raw<-reactive({
     build_signal(hl_ctx=rv$r_hl_ctx,hl_spot=rv$r_hl_spot,bn_perp=rv$r_bn_perp,
                  bn_prem=rv$r_bn_prem,bybit_perp=rv$r_bybit,
                  ob_result=ob_result(),twaps=signal_twaps(),fund_hist=rv$r_hl_fund,
@@ -1111,7 +1210,21 @@ server <- function(input, output, session) {
                  trade_flow=trade_flow(),prev_oi=rv$prev_oi)
   })
 
-  tplan<-reactive(build_trade_plan(sig(), rv$r_hl_ctx, ob_result()))
+  # EWMA smoothing of the composite to suppress 15s whipsaw
+  observeEvent(sig_raw(), {
+    raw<-sig_raw()$score
+    if(!is.na(raw)) rv$score_ewma <- if(is.na(rv$score_ewma)) raw else
+      EWMA_ALPHA*raw + (1-EWMA_ALPHA)*rv$score_ewma
+  }, ignoreNULL=FALSE)
+
+  # Actionable signal = smoothed score (decisions act on this; raw shown as secondary)
+  sig<-reactive({
+    s<-sig_raw(); s$score_raw<-s$score
+    if(!is.na(rv$score_ewma)&&!is.na(s$score)) s$score<-round(rv$score_ewma,1)
+    s
+  })
+
+  tplan<-reactive(build_trade_plan(sig(), rv$r_hl_ctx, ob_result(), atr5(), rvol5()))
 
   observe({
     s <- sig(); tp <- tplan()
@@ -1128,10 +1241,12 @@ server <- function(input, output, session) {
   # ---- Signal hero ----
   output$signal_hero<-renderUI({
     s<-sig(); sc<-if(!is.null(s)) s$score else NA
+    raw<-if(!is.null(s)&&!is.null(s$score_raw)) s$score_raw else NA
     conf<-if(!is.null(s)) s$confidence else 0
     lb<-sig_label(sc); col<-sig_col(sc); bg<-sig_bg(sc)
     ccol<-conf_col(conf)
     pct<-(if(!is.na(sc)) sc+100 else 100)/2
+    vr<-tplan()$vol_regime
 
     div(class="signal-hero", style=paste0("background:",bg,";"),
       div(class="signal-score",style=paste0("color:",col,";"),if(!is.na(sc)) sc else "—"),
@@ -1140,8 +1255,14 @@ server <- function(input, output, session) {
         div(class="gauge-mid"),
         div(class="gauge-fill",style=paste0("width:",pct,"%;background:",col,";"))),
       div(class="score-scale", span("-100 Sell"), span("0"), span("+100 Buy")),
-      div(class="signal-conf",style=paste0("background:",ccol,"18;color:",ccol,";border:1px solid ",ccol,"33;"),
-          paste0("Confidence: ",conf,"%"))
+      div(style="display:flex;gap:8px;justify-content:center;align-items:center;margin-top:10px;flex-wrap:wrap;",
+        div(class="signal-conf",style=paste0("background:",ccol,"18;color:",ccol,";border:1px solid ",ccol,"33;margin-top:0;"),
+            paste0("Confidence: ",conf,"%")),
+        span(style="font-size:10px;color:#94a3b8;",
+             paste0("raw ",ifelse(!is.na(raw)&&raw>=0,"+",""),if(!is.na(raw)) raw else "—"," · smoothed (EWMA ",EWMA_ALPHA,")")),
+        span(style="font-size:10px;color:#64748b;padding:2px 8px;background:#f1f5f9;border-radius:10px;",
+             paste0("vol: ",vr))
+      )
     )
   })
 
@@ -1365,11 +1486,21 @@ server <- function(input, output, session) {
     if(length(rows) == 0) return(div(style="font-size:11px;color:#94a3b8;", "No trades in selected horizons"))
 
     all_perf <- calc_performance(trades, NULL)
-    summary <- div(style="margin-top:8px;padding-top:8px;border-top:1px solid #e2e8f0;font-size:10px;color:#64748b;display:flex;justify-content:space-between;",
-      span(paste0("Best: +$",all_perf$best)),
-      span(paste0("Worst: $",all_perf$worst)),
-      span(paste0("Fees paid: $",formatC(all_perf$fees,format="f",digits=2))),
-      span(paste0("Expectancy: $",all_perf$expectancy,"/trade"))
+    pf_str <- if(is.na(all_perf$profit_factor)) "—" else all_perf$profit_factor
+    sh_str <- if(is.na(all_perf$sharpe)) "—" else all_perf$sharpe
+    summary <- tagList(
+      div(style="margin-top:8px;padding-top:8px;border-top:1px solid #e2e8f0;font-size:10px;color:#64748b;display:flex;justify-content:space-between;",
+        span(paste0("Sharpe (per-trade): ",sh_str)),
+        span(paste0("Profit factor: ",pf_str)),
+        span(style=paste0("color:",if(all_perf$max_dd<0)"#dc2626" else "#64748b",";"),
+             paste0("Max DD: $",formatC(all_perf$max_dd,format="f",digits=2)))
+      ),
+      div(style="margin-top:4px;font-size:10px;color:#94a3b8;display:flex;justify-content:space-between;",
+        span(paste0("Best: +$",all_perf$best)),
+        span(paste0("Worst: $",all_perf$worst)),
+        span(paste0("Fees paid: $",formatC(all_perf$fees,format="f",digits=2))),
+        span(paste0("Exp: $",all_perf$expectancy,"/trade"))
+      )
     )
 
     equity <- ACCOUNT_SIZE + pos$realized_pnl
