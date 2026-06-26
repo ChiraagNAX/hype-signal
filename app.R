@@ -623,6 +623,8 @@ new_position <- function() {
        pending_entry=NA, pending_dir=NA, pending_stop=NA, pending_tp1=NA,
        pending_tp2=NA, pending_size_usd=NA, pending_size_coins=NA,
        pending_score=NA, pending_at=NA, pending_horizon_s=NA,
+       hedge_active=FALSE, hedge_dir=NA, hedge_entry=NA, hedge_size_usd=NA,
+       hedge_size_coins=NA, hedge_stop=NA, hedge_opened_at=NA,
        realized_pnl=realized, trade_log=saved)
 }
 
@@ -662,9 +664,42 @@ calc_pnl <- function(pos, cur_px) {
        fees=round(fees_usd,2))
 }
 
-update_position <- function(pos, sig_result, tplan, cur_px) {
+update_position <- function(pos, sig_result, tplan, cur_px, twaps=NULL) {
   if(is.na(cur_px)) return(pos)
   now <- as.numeric(Sys.time())
+
+  # Check hedge status first
+  if(isTRUE(pos$hedge_active)) {
+    hedge_pnl_raw <- if(pos$hedge_dir=="SHORT") (pos$hedge_entry - cur_px)/pos$hedge_entry
+                     else (cur_px - pos$hedge_entry)/pos$hedge_entry
+    hedge_exit <- FALSE; hedge_reason <- NULL
+
+    # Close hedge if: signal realigns with primary, or hedge stop hit, or hedge profitable enough
+    if(pos$direction=="LONG" && sig_result$score > 10) { hedge_exit<-TRUE; hedge_reason<-"Signal realigned bullish" }
+    if(pos$direction=="SHORT" && sig_result$score < -10) { hedge_exit<-TRUE; hedge_reason<-"Signal realigned bearish" }
+    if(pos$hedge_dir=="SHORT" && cur_px >= pos$hedge_stop) { hedge_exit<-TRUE; hedge_reason<-"Hedge stop hit" }
+    if(pos$hedge_dir=="LONG" && cur_px <= pos$hedge_stop) { hedge_exit<-TRUE; hedge_reason<-"Hedge stop hit" }
+    if(hedge_pnl_raw > 0.01) { hedge_exit<-TRUE; hedge_reason<-"Hedge profit taken (1%+)" }
+    if((now - pos$hedge_opened_at) > 3600) { hedge_exit<-TRUE; hedge_reason<-"Hedge time limit (1h)" }
+
+    if(hedge_exit) {
+      hedge_gross <- hedge_pnl_raw * pos$hedge_size_usd
+      hedge_fees <- pos$hedge_size_usd * ROUND_TRIP
+      hedge_net <- hedge_gross - hedge_fees
+      trade <- list(dir=paste0("HEDGE-",pos$hedge_dir), entry=pos$hedge_entry, exit=cur_px,
+                    size_usd=pos$hedge_size_usd, pnl_usd=round(hedge_net,2),
+                    pnl_pct=round((hedge_net/pos$hedge_size_usd)*100,2),
+                    fees=round(hedge_fees,2), reason=hedge_reason,
+                    opened=pos$hedge_opened_at, closed=now,
+                    duration_m=round((now - pos$hedge_opened_at)/60,1))
+      pos$trade_log <- c(pos$trade_log, list(trade))
+      save_trade_log(pos$trade_log)
+      pos$realized_pnl <- pos$realized_pnl + hedge_net
+      pos$hedge_active <- FALSE; pos$hedge_dir <- NA; pos$hedge_entry <- NA
+      pos$hedge_size_usd <- NA; pos$hedge_size_coins <- NA
+      pos$hedge_stop <- NA; pos$hedge_opened_at <- NA
+    }
+  }
 
   if(pos$state == "FLAT") {
     if(tplan$direction != "FLAT" && !is.na(tplan$entry_num) && !is.na(tplan$stop_num)) {
@@ -722,14 +757,38 @@ update_position <- function(pos, sig_result, tplan, cur_px) {
     pnl <- calc_pnl(pos, cur_px)
     exit_reason <- NULL
 
+    # Check 4h TWAP for longer-term structure
+    lt_bullish <- !is.null(twaps) && !is.na(twaps$t240) && twaps$t240 > 0 && cur_px < twaps$t240
+    lt_bearish <- !is.null(twaps) && !is.na(twaps$t240) && twaps$t240 > 0 && cur_px > twaps$t240
+
     if(pos$direction == "LONG") {
       if(cur_px <= pos$stop_px) exit_reason <- "STOP LOSS"
       if(!is.na(pos$tp2_px) && cur_px >= pos$tp2_px) exit_reason <- "TARGET 2 HIT"
-      if(sig_result$score < -20) exit_reason <- "SIGNAL FLIPPED BEARISH"
+      if(sig_result$score < -20) {
+        if(lt_bullish && !isTRUE(pos$hedge_active) && is.null(exit_reason)) {
+          hedge_sz <- pos$size_usd * 0.5
+          pos$hedge_active <- TRUE; pos$hedge_dir <- "SHORT"
+          pos$hedge_entry <- cur_px; pos$hedge_size_usd <- hedge_sz
+          pos$hedge_size_coins <- round(hedge_sz/cur_px, 3)
+          pos$hedge_stop <- cur_px * 1.008; pos$hedge_opened_at <- now
+        } else if(!isTRUE(pos$hedge_active)) {
+          exit_reason <- "SIGNAL FLIPPED BEARISH"
+        }
+      }
     } else {
       if(cur_px >= pos$stop_px) exit_reason <- "STOP LOSS"
       if(!is.na(pos$tp2_px) && cur_px <= pos$tp2_px) exit_reason <- "TARGET 2 HIT"
-      if(sig_result$score > 20) exit_reason <- "SIGNAL FLIPPED BULLISH"
+      if(sig_result$score > 20) {
+        if(lt_bearish && !isTRUE(pos$hedge_active) && is.null(exit_reason)) {
+          hedge_sz <- pos$size_usd * 0.5
+          pos$hedge_active <- TRUE; pos$hedge_dir <- "LONG"
+          pos$hedge_entry <- cur_px; pos$hedge_size_usd <- hedge_sz
+          pos$hedge_size_coins <- round(hedge_sz/cur_px, 3)
+          pos$hedge_stop <- cur_px * 0.992; pos$hedge_opened_at <- now
+        } else if(!isTRUE(pos$hedge_active)) {
+          exit_reason <- "SIGNAL FLIPPED BULLISH"
+        }
+      }
     }
 
     if(now > pos$horizon_end) exit_reason <- "HORIZON EXPIRED"
@@ -1057,7 +1116,7 @@ server <- function(input, output, session) {
   observe({
     s <- sig(); tp <- tplan()
     px <- s$cur_px
-    if(!is.na(px)) rv$pos <- update_position(rv$pos, s, tp, px)
+    if(!is.na(px)) rv$pos <- update_position(rv$pos, s, tp, px, signal_twaps())
   })
 
   # =============================================================================
@@ -1226,7 +1285,26 @@ server <- function(input, output, session) {
           span(paste0("Fees: $", pnl$fees)),
           span(paste0(elapsed, "min in | ", remaining, "min left")),
           span(paste0("Gross: $", formatC(pnl$usd,format="f",digits=2)))
-        )
+        ),
+        if(isTRUE(pos$hedge_active)) {
+          h_raw <- if(pos$hedge_dir=="SHORT") (pos$hedge_entry-cur_px)/pos$hedge_entry
+                   else (cur_px-pos$hedge_entry)/pos$hedge_entry
+          h_net <- round(h_raw*pos$hedge_size_usd - pos$hedge_size_usd*ROUND_TRIP, 2)
+          h_col <- if(h_net>=0) "#16a34a" else "#dc2626"
+          h_age <- round((as.numeric(Sys.time()) - pos$hedge_opened_at)/60, 0)
+          div(style="margin-top:8px;padding:8px;background:#fef3c7;border-radius:6px;border:1px solid #fbbf24;",
+            div(style="font-size:10px;font-weight:700;color:#92400e;margin-bottom:4px;",
+                paste0("⚡ HEDGE ACTIVE — ", pos$hedge_dir, " ", pos$hedge_size_coins, " HYPE @ $", fp(pos$hedge_entry))),
+            div(style="display:flex;justify-content:space-between;font-size:10px;",
+              span(style=paste0("font-weight:600;color:",h_col,";"),
+                   paste0("P&L: ",ifelse(h_net>=0,"+",""),"$",formatC(abs(h_net),format="f",digits=2))),
+              span(style="color:#92400e;", paste0("Stop: $",fp(pos$hedge_stop))),
+              span(style="color:#92400e;", paste0(h_age,"min | max 60min"))
+            ),
+            div(style="font-size:9px;color:#a16207;margin-top:3px;",
+                "Temporary hedge — closes when signal realigns with primary position")
+          )
+        } else NULL
       )
     } else {
       div(style="font-size:11px;color:#94a3b8;", "No active position — waiting for signal alignment")
